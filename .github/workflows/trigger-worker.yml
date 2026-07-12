@@ -1,0 +1,58 @@
+name: Trigger EV Scanner worker
+
+# Perché questo workflow esiste:
+# Il worker (worker/resolve_bets_web.php) va richiamato periodicamente, ma
+# l'hosting gratuito (free.je, stesso ecosistema di InfinityFree) protegge
+# TUTTE le richieste esterne con una JS-challenge anti-bot (slowAES): un
+# semplice HTTP GET (cron-job.org, curl, wget, UptimeRobot...) riceve solo
+# una paginetta con JavaScript da eseguire, mai lo script PHP vero. Serve
+# quindi un browser reale che esegua quel JavaScript — Playwright headless
+# (Chromium) lo fa, GRATIS, dentro GitHub Actions.
+#
+# SETUP RICHIESTO (una tantum):
+#  1) Crea un repository GitHub (anche privato) e carica questa cartella
+#     cosi' com'e' (.github/workflows/trigger-worker.yml + trigger.js +
+#     package.json).
+#  2) Settings del repo -> Secrets and variables -> Actions -> New repository
+#     secret:
+#        Nome:  WORKER_URL
+#        Valore: http://evscanner.free.je/ev-scanner/worker/resolve_bets_web.php?token=IL_TUO_TOKEN
+#     (il token NON va scritto qui nel file YAML: e' un segreto, va sempre
+#     nei Secrets di GitHub, mai committato in chiaro nel repository, anche
+#     se il repo e' privato — buona pratica indipendente dalla visibilita'.)
+#  3) Fatto. Il workflow parte da solo secondo lo schedule sotto. Puoi anche
+#     lanciarlo a mano da Actions -> Trigger EV Scanner worker -> Run workflow
+#     per testarlo subito senza aspettare.
+#
+# NOTA sui tempi: GitHub Actions su runner pubblici NON garantisce che uno
+# schedule "*/15" parta esattamente ogni 15 minuti — in certi momenti di
+# carico puo' slittare di qualche minuto. Va benissimo per questo caso d'uso
+# (finestra void di 120 minuti, finestra CLV di 3 ore): qualche minuto di
+# ritardo occasionale non cambia nulla nella pratica.
+
+on:
+  schedule:
+    - cron: '*/15 * * * *' # ogni 15 minuti
+  workflow_dispatch: {} # permette anche l'avvio manuale da GitHub, utile per testare subito
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3 # il worker PHP stesso ha gia' i suoi timeout interni; questo e' solo un tetto di sicurezza per il job
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Installa dipendenze
+        run: npm install
+
+      - name: Installa Chromium per Playwright
+        run: npx playwright install --with-deps chromium
+
+      - name: Esegui il trigger del worker
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+        run: node trigger.js
