@@ -32,7 +32,7 @@ name: Trigger EV Scanner worker
 
 on:
   schedule:
-    - cron: '*/15 * * * *' # ogni 15 minuti
+    - cron: '*/20 * * * *' # ogni 20 minuti
   workflow_dispatch: {} # permette anche l'avvio manuale da GitHub, utile per testare subito
 
 jobs:
