@@ -25,7 +25,7 @@ name: Trigger EV Scanner worker
 #     per testarlo subito senza aspettare.
 #
 # NOTA sui tempi: GitHub Actions su runner pubblici NON garantisce che uno
-# schedule "*/15" parta esattamente ogni 15 minuti — in certi momenti di
+# schedule "*/20" parta esattamente ogni 20 minuti — in certi momenti di
 # carico puo' slittare di qualche minuto. Va benissimo per questo caso d'uso
 # (finestra void di 120 minuti, finestra CLV di 3 ore): qualche minuto di
 # ritardo occasionale non cambia nulla nella pratica.
