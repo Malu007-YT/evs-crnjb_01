@@ -1,24 +1,20 @@
-const { chromium } = require('playwright-extra');
-const stealth = require('puppeteer-extra-plugin-stealth')();
-
-// Applica il plugin stealth per rimuovere le tracce di automazione (navigator.webdriver, ecc.)
-chromium.use(stealth);
+const { chromium } = require('playwright');
 
 async function runTrigger(url, name) {
-    console.log(`[${name}] Avvio richiesta stealth...`);
+    console.log(`[${name}] Avvio richiesta stealth con Playwright nativo...`);
     
-    // Configurazione avanzata del browser per emulare un utente reale su Windows
+    // 1. Lancio del browser con rimozione dei flag di automazione standard
     const browser = await chromium.launch({ 
         headless: true,
         args: [
-            '--disable-blink-features=AutomationControlled', // Nasconde il controllo automazione
+            '--disable-blink-features=AutomationControlled', // Nasconde l'automazione nativa di Blink
             '--disable-infobars',
             '--no-sandbox',
             '--window-size=1920,1080'
         ]
     });
 
-    // Configura un contesto con impronta digitale umana
+    // 2. Creazione di un contesto con impronta digitale umana realistica (Windows + Chrome)
     const context = await browser.newContext({
         userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
         viewport: { width: 1920, height: 1080 },
@@ -34,30 +30,42 @@ async function runTrigger(url, name) {
 
     const page = await context.newPage();
 
+    // 3. INIEZIONE STEALTH NATURALE: Elimina la traccia "navigator.webdriver" prima che la pagina carichi
+    await page.addInitScript(() => {
+        Object.defineProperty(navigator, 'webdriver', {
+            get: () => undefined
+        });
+        // Simula la presenza dei plugin classici di un browser reale
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => [1, 2, 3, 4, 5]
+        });
+    });
+
     try {
-        // Naviga verso l'URL simulando un'attesa normale
+        // 4. Navigazione attendendo che la JS-challenge completi l'esecuzione e la rete si stabilizzi
         const response = await page.goto(url, { 
-            waitUntil: 'networkidle', // Attende che la sfida JS / slowAES sia completata e la rete sia stabile
+            waitUntil: 'networkidle', // Fondamentale: aspetta i redirect della sfida slowAES
             timeout: 60000 
         });
 
-        // Piccolo trucco: muovi leggermente il mouse o scrolla per attivare eventuali listener di comportamento umano
-        await page.mouse.move(100, 100);
-        await page.waitForTimeout(3000); // Pausa di 3 secondi per dare tempo al cookie di stabilizzarsi
+        // Simula una micro-interazione per sbloccare eventuali listener comportamentali
+        await page.mouse.move(200, 200);
+        await page.waitForTimeout(3000); // Pausa di 3 secondi per consentire il completamento dei cookie
 
-        // Estrai il contenuto per verificare se ha risposto il JSON o se siamo ancora bloccati
+        // Estrazione del contenuto testuale restituito dal PHP
         const content = await page.textContent('body');
-        console.log(`[${name}] Status codice: ${response.status()}`);
-        console.log(`[${name}] Risposta del server:\n`, content.trim());
+        console.log(`[${name}] Status HTTP: ${response.status()}`);
+        console.log(`[${name}] Output ottenuto:\n`, content.trim());
 
+        // Controllo della validità della risposta
         if (!content.includes('"success":true') && !content.includes('success')) {
-            throw new Error(`Rilevato potenziale blocco anti-bot o risposta non valida.`);
+            throw new Error(`Risposta non valida. È possibile che lo sblocco anti-bot sia fallito.`);
         }
 
     } catch (error) {
-        console.error(`[${name}] Errore durante l'esecuzione:`, error.message);
-        // Cattura uno screenshot per fare debug nei log di GitHub in caso di fallimento
-        await page.screenshot({ path: `failure-${name}.png` });
+        console.error(`[${name}] Errore riscontrato:`, error.message);
+        // Salva uno screenshot locale utile per controllare il blocco nei log di GitHub Actions
+        await page.screenshot({ path: `error-${name}.png` });
         throw error;
     } finally {
         await browser.close();
@@ -69,24 +77,22 @@ async function main() {
     const workerUrl = process.env.WORKER_URL;
 
     if (!scanUrl || !workerUrl) {
-        console.error("Errore: SCAN_URL o WORKER_URL non configurati nei Secrets di GitHub.");
+        console.error("Errore: SCAN_URL o WORKER_URL mancano nell'ambiente (env).");
         process.exit(1);
     }
 
     try {
-        // 1. Esegue lo scanner
+        // Esecuzione sequenziale dei due worker
         await runTrigger(scanUrl, "SCANNER");
         
-        // Attesa precauzionale tra un endpoint e l'altro
-        console.log("Attesa di 5 secondi prima del prossimo worker...");
+        console.log("Attesa precauzionale di 5 secondi...");
         await new Promise(resolve => setTimeout(resolve, 5000));
         
-        // 2. Esegue la risoluzione esiti
         await runTrigger(workerUrl, "RESOLVER");
         
-        console.log("Tutti i trigger completati con successo.");
+        console.log("Entrambi i trigger eseguiti correttamente.");
     } catch (e) {
-        console.error("Il workflow è fallito in uno dei passaggi.");
+        console.error("Esecuzione del workflow interrotta per errore.");
         process.exit(1);
     }
 }
