@@ -1,71 +1,94 @@
-name: Trigger EV Scanner worker
+const { chromium } = require('playwright-extra');
+const stealth = require('puppeteer-extra-plugin-stealth')();
 
-# Perché questo workflow esiste:
-# L'hosting gratuito (free.je, stesso ecosistema di InfinityFree) protegge
-# TUTTE le richieste esterne con una JS-challenge anti-bot (slowAES): un
-# semplice HTTP GET (cron-job.org, curl, wget, UptimeRobot...) riceve solo
-# una paginetta con JavaScript da eseguire, mai lo script PHP vero. Serve
-# quindi un browser reale che esegua quel JavaScript — Playwright headless
-# (Chromium) lo fa, GRATIS, dentro GitHub Actions.
-#
-# Richiama in sequenza DUE endpoint (vedi trigger.js):
-#   1) lo scanner (worker/scan_web.php) — prima girava lato client nel
-#      browser dell'utente quando risultava "scaduto", causando lag durante
-#      la navigazione: ora gira solo qui, in background.
-#   2) la risoluzione esiti + CLV (worker/resolve_bets_web.php).
-#
-# SETUP RICHIESTO (una tantum):
-#  1) Crea un repository GitHub (anche privato) e carica questa cartella
-#     cosi' com'e' (.github/workflows/trigger-worker.yml + trigger.js +
-#     package.json).
-#  2) Settings del repo -> Secrets and variables -> Actions -> New repository
-#     secret, DUE volte:
-#        Nome: WORKER_URL
-#        Valore: http://evscanner.free.je/ev-scanner/worker/resolve_bets_web.php?token=IL_TUO_TOKEN
-#        Nome: SCAN_URL
-#        Valore: http://evscanner.free.je/ev-scanner/worker/scan_web.php?token=IL_TUO_TOKEN
-#     (stesso token per entrambi, e' lo stesso WORKER_SECRET_TOKEN in
-#     config/config.php — il token NON va mai scritto nel file YAML, solo
-#     nei Secrets di GitHub.)
-#  3) Fatto. Il workflow parte da solo secondo lo schedule sotto. Puoi anche
-#     lanciarlo a mano da Actions -> Trigger EV Scanner worker -> Run workflow
-#     per testarlo subito senza aspettare.
-#
-# FREQUENZA: ogni 20 minuti (era 15 — allungata di proposito per consumare
-# meno budget richieste di odds-api.io/API-Sports nell'arco della giornata,
-# mantenendo comunque una cadenza piu' che sufficiente per non perdere
-# occasioni di value bet ne' la finestra di cattura CLV di 3 ore).
-#
-# NOTA sui tempi: GitHub Actions su runner pubblici NON garantisce che uno
-# schedule "*/20" parta esattamente ogni 20 minuti — in certi momenti di
-# carico puo' slittare di qualche minuto. Va benissimo per questo caso
-# d'uso: qualche minuto di ritardo occasionale non cambia nulla nella
-# pratica.
+// Applica il plugin stealth per rimuovere le tracce di automazione (navigator.webdriver, ecc.)
+chromium.use(stealth);
 
-on:
-  schedule:
-    - cron: '*/20 * * * *' # ogni 20 minuti
-  workflow_dispatch: {} # permette anche l'avvio manuale da GitHub, utile per testare subito
+async function runTrigger(url, name) {
+    console.log(`[${name}] Avvio richiesta stealth...`);
+    
+    // Configurazione avanzata del browser per emulare un utente reale su Windows
+    const browser = await chromium.launch({ 
+        headless: true,
+        args: [
+            '--disable-blink-features=AutomationControlled', // Nasconde il controllo automazione
+            '--disable-infobars',
+            '--no-sandbox',
+            '--window-size=1920,1080'
+        ]
+    });
 
-jobs:
-  trigger:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5 # scan + resolve insieme richiedono un po' piu' di margine di prima (un solo endpoint)
-    steps:
-      - uses: actions/checkout@v4
+    // Configura un contesto con impronta digitale umana
+    const context = await browser.newContext({
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        viewport: { width: 1920, height: 1080 },
+        locale: 'it-IT',
+        timezoneId: 'Europe/Rome',
+        extraHTTPHeaders: {
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Cache-Control': 'max-age=0',
+            'Upgrade-Insecure-Requests': '1'
+        }
+    });
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
+    const page = await context.newPage();
 
-      - name: Installa dipendenze
-        run: npm install
+    try {
+        // Naviga verso l'URL simulando un'attesa normale
+        const response = await page.goto(url, { 
+            waitUntil: 'networkidle', // Attende che la sfida JS / slowAES sia completata e la rete sia stabile
+            timeout: 60000 
+        });
 
-      - name: Installa Chromium per Playwright
-        run: npx playwright install --with-deps chromium
+        // Piccolo trucco: muovi leggermente il mouse o scrolla per attivare eventuali listener di comportamento umano
+        await page.mouse.move(100, 100);
+        await page.waitForTimeout(3000); // Pausa di 3 secondi per dare tempo al cookie di stabilizzarsi
 
-      - name: Esegui il trigger dei worker
-        env:
-          WORKER_URL: ${{ secrets.WORKER_URL }}
-          SCAN_URL: ${{ secrets.SCAN_URL }}
-        run: node trigger.js
+        // Estrai il contenuto per verificare se ha risposto il JSON o se siamo ancora bloccati
+        const content = await page.textContent('body');
+        console.log(`[${name}] Status codice: ${response.status()}`);
+        console.log(`[${name}] Risposta del server:\n`, content.trim());
+
+        if (!content.includes('"success":true') && !content.includes('success')) {
+            throw new Error(`Rilevato potenziale blocco anti-bot o risposta non valida.`);
+        }
+
+    } catch (error) {
+        console.error(`[${name}] Errore durante l'esecuzione:`, error.message);
+        // Cattura uno screenshot per fare debug nei log di GitHub in caso di fallimento
+        await page.screenshot({ path: `failure-${name}.png` });
+        throw error;
+    } finally {
+        await browser.close();
+    }
+}
+
+async function main() {
+    const scanUrl = process.env.SCAN_URL;
+    const workerUrl = process.env.WORKER_URL;
+
+    if (!scanUrl || !workerUrl) {
+        console.error("Errore: SCAN_URL o WORKER_URL non configurati nei Secrets di GitHub.");
+        process.exit(1);
+    }
+
+    try {
+        // 1. Esegue lo scanner
+        await runTrigger(scanUrl, "SCANNER");
+        
+        // Attesa precauzionale tra un endpoint e l'altro
+        console.log("Attesa di 5 secondi prima del prossimo worker...");
+        await new Promise(resolve => setTimeout(resolve, 5000));
+        
+        // 2. Esegue la risoluzione esiti
+        await runTrigger(workerUrl, "RESOLVER");
+        
+        console.log("Tutti i trigger completati con successo.");
+    } catch (e) {
+        console.error("Il workflow è fallito in uno dei passaggi.");
+        process.exit(1);
+    }
+}
+
+main();
