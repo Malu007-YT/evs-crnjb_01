@@ -1,100 +1,29 @@
-const { chromium } = require('playwright');
+name: Trigger EV Scanner worker
 
-async function runTrigger(url, name) {
-    console.log(`[${name}] Avvio richiesta stealth con Playwright nativo...`);
-    
-    // 1. Lancio del browser con rimozione dei flag di automazione standard
-    const browser = await chromium.launch({ 
-        headless: true,
-        args: [
-            '--disable-blink-features=AutomationControlled', // Nasconde l'automazione nativa di Blink
-            '--disable-infobars',
-            '--no-sandbox',
-            '--window-size=1920,1080'
-        ]
-    });
+on:
+  schedule:
+    - cron: '*/20 * * * *'
+  workflow_dispatch: {}
 
-    // 2. Creazione di un contesto con impronta digitale umana realistica (Windows + Chrome)
-    const context = await browser.newContext({
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-        viewport: { width: 1920, height: 1080 },
-        locale: 'it-IT',
-        timezoneId: 'Europe/Rome',
-        extraHTTPHeaders: {
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-            'Accept-Language': 'it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Cache-Control': 'max-age=0',
-            'Upgrade-Insecure-Requests': '1'
-        }
-    });
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
 
-    const page = await context.newPage();
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
 
-    // 3. INIEZIONE STEALTH NATURALE: Elimina la traccia "navigator.webdriver" prima che la pagina carichi
-    await page.addInitScript(() => {
-        Object.defineProperty(navigator, 'webdriver', {
-            get: () => undefined
-        });
-        // Simula la presenza dei plugin classici di un browser reale
-        Object.defineProperty(navigator, 'plugins', {
-            get: () => [1, 2, 3, 4, 5]
-        });
-    });
+      - name: Installa dipendenze
+        run: npm install
 
-    try {
-        // 4. Navigazione attendendo che la JS-challenge completi l'esecuzione e la rete si stabilizzi
-        const response = await page.goto(url, { 
-            waitUntil: 'networkidle', // Fondamentale: aspetta i redirect della sfida slowAES
-            timeout: 60000 
-        });
+      - name: Installa Chromium per Playwright
+        run: npx playwright install --with-deps chromium
 
-        // Simula una micro-interazione per sbloccare eventuali listener comportamentali
-        await page.mouse.move(200, 200);
-        await page.waitForTimeout(3000); // Pausa di 3 secondi per consentire il completamento dei cookie
-
-        // Estrazione del contenuto testuale restituito dal PHP
-        const content = await page.textContent('body');
-        console.log(`[${name}] Status HTTP: ${response.status()}`);
-        console.log(`[${name}] Output ottenuto:\n`, content.trim());
-
-        // Controllo della validità della risposta
-        if (!content.includes('"success":true') && !content.includes('success')) {
-            throw new Error(`Risposta non valida. È possibile che lo sblocco anti-bot sia fallito.`);
-        }
-
-    } catch (error) {
-        console.error(`[${name}] Errore riscontrato:`, error.message);
-        // Salva uno screenshot locale utile per controllare il blocco nei log di GitHub Actions
-        await page.screenshot({ path: `error-${name}.png` });
-        throw error;
-    } finally {
-        await browser.close();
-    }
-}
-
-async function main() {
-    const scanUrl = process.env.SCAN_URL;
-    const workerUrl = process.env.WORKER_URL;
-
-    if (!scanUrl || !workerUrl) {
-        console.error("Errore: SCAN_URL o WORKER_URL mancano nell'ambiente (env).");
-        process.exit(1);
-    }
-
-    try {
-        // Esecuzione sequenziale dei due worker
-        await runTrigger(scanUrl, "SCANNER");
-        
-        console.log("Attesa precauzionale di 5 secondi...");
-        await new Promise(resolve => setTimeout(resolve, 5000));
-        
-        await runTrigger(workerUrl, "RESOLVER");
-        
-        console.log("Entrambi i trigger eseguiti correttamente.");
-    } catch (e) {
-        console.error("Esecuzione del workflow interrotta per errore.");
-        process.exit(1);
-    }
-}
-
-main();
+      - name: Esegui il trigger dei worker
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          SCAN_URL: ${{ secrets.SCAN_URL }}
+        run: node trigger.js
