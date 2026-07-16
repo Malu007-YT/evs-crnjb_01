@@ -1,56 +1,20 @@
-name: EV Scanner - Trigger & Shadow Engine
+name: Shadow Engine (EV Scanner AI Research Lab)
 
 on:
   schedule:
-    - cron: '*/20 * * * *'    # Trigger worker ogni 20 min
-    - cron: '*/15 * * * *'    # Shadow Engine ogni 15 min
+    # Ogni 15 minuti - Shadow Engine Python
+    - cron: '*/15 * * * *'
   workflow_dispatch: {}
 
-# Evita esecuzioni parallele dello stesso job
+# Evita esecuzioni parallele: se un run è in corso, il successivo aspetta
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: shadow-engine
   cancel-in-progress: false
 
 jobs:
-  # ------------------------------------------------------------
-  # JOB 1: Trigger Worker PHP (Playwright) - ogni 20 min
-  # ------------------------------------------------------------
-  trigger-worker:
-    if: github.event.schedule == '*/20 * * * *' || github.event_name == 'workflow_dispatch'
+  run-shadow-engine:
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
-      - name: Installa dipendenze
-        run: npm ci
-
-      - name: Installa Chromium per Playwright
-        run: npx playwright install --with-deps chromium
-
-      - name: Esegui trigger worker
-        env:
-          WORKER_URL: ${{ secrets.WORKER_URL }}
-          SCAN_URL: ${{ secrets.SCAN_URL }}
-        run: node trigger.js
-
-  # ------------------------------------------------------------
-  # JOB 2: Shadow Engine Python - ogni 15 min
-  # ------------------------------------------------------------
-  shadow-engine:
-    if: github.event.schedule == '*/15 * * * *' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    # Evita sovrapposizioni: se un run è in corso, il successivo aspetta
-    concurrency:
-      group: shadow-engine
-      cancel-in-progress: false
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
