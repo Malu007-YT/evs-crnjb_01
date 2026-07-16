@@ -24,14 +24,14 @@ jobs:
         with:
           python-version: '3.11'
           cache: 'pip'
-          cache-dependency-path: Ev-scanner-cronjob-main/ev_scanner_shadow_lab/main/requirements.txt
+          cache-dependency-path: ev_scanner_shadow_lab/main/requirements.txt
 
       - name: Installa dipendenze Python
         working-directory: Ev-scanner-cronjob-main/ev_scanner_shadow_lab/main
         run: pip install -r requirements.txt
 
       - name: Esegui ciclo Shadow Engine
-        working-directory: Ev-scanner-cronjob-main/ev_scanner_shadow_lab/main
+        working-directory: ev_scanner_shadow_lab/main
         env:
           # URL completo dell'endpoint resolve_bets_web.php su InfinityFree
           # Esempio: https://tuodominio.infinityfreeapp.com/worker/resolve_bets_web.php
