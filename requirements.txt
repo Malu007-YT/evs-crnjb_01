@@ -2,5 +2,5 @@
 # Installazione: pip install -r requirements.txt
 # (su alcuni sistemi/ambienti gestiti serve aggiungere --break-system-packages)
 
-pymysql>=1.1.0        # driver MySQL pure-Python, nessuna dipendenza da compilazione nativa
-python-dotenv>=1.0.0  # caricamento credenziali da file .env, mai hardcoded nel codice
+requests>=2.31.0       # client HTTP per chiamate al proxy PHP su InfinityFree
+python-dotenv>=1.0.0   # caricamento credenziali da file .env, mai hardcoded nel codice
