@@ -1,9 +1,8 @@
 name: Shadow Engine (EV Scanner AI Research Lab)
-
-on:
+on:  
   schedule:
     # Ogni 15 minuti - Shadow Engine Python
-    - cron: '*/15 * * * *'
+    - cron: '*/15 * * * *'  
   workflow_dispatch: {}
 
 # Evita esecuzioni parallele: se un run è in corso, il successivo aspetta
@@ -27,22 +26,16 @@ jobs:
           cache-dependency-path: ev_scanner_shadow_lab/main/requirements.txt
 
       - name: Installa dipendenze Python
-        working-directory: Ev-scanner-cronjob-main/ev_scanner_shadow_lab/main
+        working-directory: ev_scanner_shadow_lab/main
         run: pip install -r requirements.txt
 
       - name: Esegui ciclo Shadow Engine
         working-directory: ev_scanner_shadow_lab/main
         env:
           # URL completo dell'endpoint resolve_bets_web.php su InfinityFree
-          # Esempio: https://tuodominio.infinityfreeapp.com/worker/resolve_bets_web.php
           SHADOW_API_URL: ${{ secrets.SHADOW_API_URL }}
-
-          # Bearer Token per autenticazione (deve coincidere con WORKER_SECRET_TOKEN in config/config.php)
+          # Bearer Token per autenticazione
           SHADOW_API_TOKEN: ${{ secrets.SHADOW_API_TOKEN }}
-
-          # Opzionali (default: timeout 30s, max 3 retry)
-          # SHADOW_TIMEOUT_SECONDS: 30
-          # SHADOW_MAX_RETRIES: 3
         run: python3 main_shadow_engine.py
 
       - name: Riassunto esecuzione
