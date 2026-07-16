@@ -95,15 +95,34 @@ class ConfigDatabase:
 
 class ShadowDBClient:
     """
-    Client HTTP thread-safe per shadow_db_proxy.php.
-    Gestisce autenticazione, retry, timeout, validazione risposta.
+    Client HTTP thread-safe per worker/resolve_bets_web.php (azioni shadow_*).
+
+    NOTA STORICA (bug corretto): questo client parlava in origine con
+    shadow_db_proxy.php (auth via header 'Authorization: Bearer ...', payload
+    sempre come body JSON). Quell'endpoint, chiamato da GitHub Actions
+    (client non-browser, IP esterno "nuovo" ad ogni run), faceva scattare
+    quasi sempre la JS-challenge anti-bot di InfinityFree: la risposta era
+    una paginetta HTML/JS (slowAES) invece del JSON atteso.
+    worker/resolve_bets_web.php espone le STESSE azioni shadow_* (vedi fondo
+    di quel file) ma è già l'endpoint "collaudato" per le chiamate esterne
+    di GitHub Actions e usa un protocollo diverso:
+      - autenticazione: parametro di query string 'token' (confrontato con
+        WORKER_SECRET_TOKEN), NON un header Authorization Bearer;
+      - per le azioni di SOLA LETTURA, il payload va in query string
+        (il PHP legge $_GET), non nel body JSON;
+      - solo le azioni di SCRITTURA (shadow_insert_shadow_bets,
+        shadow_update_shadow_bets, shadow_log_run) leggono il payload dal
+        body JSON (php://input).
     """
+
+    # Azioni che il PHP legge dal body JSON (php://input); tutte le altre
+    # sono lette da $_GET e vanno quindi in query string.
+    _WRITE_ACTIONS = {'shadow_insert_shadow_bets', 'shadow_update_shadow_bets', 'shadow_log_run'}
 
     def __init__(self, config: ConfigDatabase):
         self.config = config
         self._session = requests.Session()
         self._session.headers.update({
-            'Authorization': f'Bearer {config.api_token}',
             'Content-Type': 'application/json',
             'Accept': 'application/json',
             'User-Agent': 'EVScanner-ShadowEngine/1.0',
@@ -123,19 +142,38 @@ class ShadowDBClient:
 
     def _call(self, action: str, payload: dict) -> dict:
         """
-        Esegue una chiamata POST all'endpoint shadow_db_proxy.php.
+        Esegue una chiamata POST all'endpoint resolve_bets_web.php.
         Restituisce il campo 'data' della risposta JSON se success=True.
         Solleva eccezione con messaggio dettagliato altrimenti.
         """
-        payload_with_action = {'action': action, **payload}
         url = self.config.api_url
+        is_write = action in self._WRITE_ACTIONS
+
+        # token + action vanno sempre in query string (il PHP li legge da
+        # $_GET['token']/$_GET['action'] con fallback a $_POST).
+        query_params = {'action': action, 'token': self.config.api_token}
+
+        if not is_write:
+            # Azioni di lettura: il PHP fa $payload = $_GET, quindi ogni
+            # parametro deve stare in query string, non nel body.
+            for key, value in payload.items():
+                if value is not None:
+                    query_params[key] = value
 
         try:
-            response = self._session.post(
-                url,
-                json=payload_with_action,
-                timeout=self.config.timeout_seconds,
-            )
+            if is_write:
+                response = self._session.post(
+                    url,
+                    params=query_params,
+                    json=payload,
+                    timeout=self.config.timeout_seconds,
+                )
+            else:
+                response = self._session.post(
+                    url,
+                    params=query_params,
+                    timeout=self.config.timeout_seconds,
+                )
         except requests.exceptions.Timeout:
             raise TimeoutError(f"Timeout ({self.config.timeout_seconds}s) chiamando {action} su {url}")
         except requests.exceptions.ConnectionError as e:
@@ -371,9 +409,9 @@ def leggi_eventi_da_valutare(cfg: ConfigDatabase, giorni_finestra: int = 3) -> L
     """
     Legge dalla tabella `eventi` di PRODUZIONE gli eventi futuri entro
     `giorni_finestra` giorni e li espande in candidate per-selection.
-    Ora supportata via HTTP proxy (action: leggi_eventi_da_valutare).
+    Ora supportata via HTTP proxy (action: shadow_read_events).
     """
-    data = _get_client()._call('leggi_eventi_da_valutare', {'giorni_finestra': giorni_finestra})
+    data = _get_client()._call('shadow_read_events', {'giorni_finestra': giorni_finestra})
     rows = data.get('rows', [])
 
     candidate_totali = []
@@ -442,11 +480,11 @@ def aggiorna_stato_shadow_bets(cfg: ConfigDatabase, aggiornamenti: List[dict]) -
 
 
 # ------------------------------------------------------------
-# Versione attiva (ORA supportata via HTTP - action: leggi_versione_attiva)
+# Versione attiva (ORA supportata via HTTP - action: shadow_read_version)
 # ------------------------------------------------------------
 
 def leggi_versione_attiva(cfg: ConfigDatabase) -> dict:
-    return _get_client()._call('leggi_versione_attiva', {})
+    return _get_client().leggi_versione_attiva()
 
 
 # ==================================================================
