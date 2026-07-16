@@ -167,7 +167,7 @@ class ShadowDBClient:
     def leggi_storico_shadow_settled(
         self, model_source: str, giorni_finestra: Optional[int] = None
     ) -> List[BetSettled]:
-        data = self._call('leggi_storico_shadow_settled', {
+        data = self._call('shadow_read_shadow_settled', {
             'model_source': model_source,
             'giorni_finestra': giorni_finestra,
         })
@@ -177,7 +177,7 @@ class ShadowDBClient:
     def leggi_storico_produzione_settled(
         self, giorni_finestra: Optional[int] = None
     ) -> List[BetSettled]:
-        data = self._call('leggi_storico_produzione_settled', {
+        data = self._call('shadow_read_production_settled', {
             'giorni_finestra': giorni_finestra,
         })
         rows = data.get('rows', [])
@@ -189,7 +189,7 @@ class ShadowDBClient:
         # Converti dataclass in dict serializzabili
         righe_serializzabili = [asdict(r) for r in righe]
         # features_snapshot_json è già stringa JSON nel dataclass
-        data = self._call('inserisci_shadow_bets', {'righe': righe_serializzabili})
+        data = self._call('shadow_insert_shadow_bets', {'righe': righe_serializzabili})
         return data.get('inserted', 0)
 
     def aggiorna_stato_shadow_bets(self, aggiornamenti: List[dict]) -> int:
@@ -199,7 +199,7 @@ class ShadowDBClient:
         """
         if not aggiornamenti:
             return 0
-        data = self._call('aggiorna_stato_shadow_bets', {'aggiornamenti': aggiornamenti})
+        data = self._call('shadow_update_shadow_bets', {'aggiornamenti': aggiornamenti})
         return data.get('updated', 0)
 
     def logga_run(
@@ -211,7 +211,7 @@ class ShadowDBClient:
         bet_shadow_generate: Optional[int] = None,
         duration_ms: Optional[int] = None,
     ) -> None:
-        self._call('logga_run', {
+        self._call('shadow_log_run', {
             'channel': channel,
             'level': level,
             'message': message,
@@ -221,18 +221,7 @@ class ShadowDBClient:
         })
 
     def leggi_versione_attiva(self) -> dict:
-        """
-        Legge la versione attiva. Non c'è azione dedicata nel proxy PHP,
-        quindi la eseguiamo tramite una query diretta sicura.
-        NOTA: Per ora usiamo un workaround - il proxy PHP non espone questa query.
-        In produzione, aggiungere action 'leggi_versione_attiva' al proxy.
-        Qui lanciamo un'eccezione chiara se chiamata.
-        """
-        raise NotImplementedError(
-            "leggi_versione_attiva() non ancora supportata via HTTP proxy. "
-            "Aggiungere action 'leggi_versione_attiva' a shadow_db_proxy.php "
-            "oppure usare ConfigDatabase.da_environment() per ottenere model_version_id da variabile d'ambiente."
-        )
+        return self._call('shadow_read_version', {})
 
     # ------------------------------------------------------------
     # Helpers conversione righe
