@@ -1,90 +1,84 @@
-name: Shadow Engine (EV Scanner AI Research Lab)
+name: EV Scanner - Trigger & Shadow Engine
 
-# ------------------------------------------------------------
-# Fa girare main_shadow_engine.py periodicamente, sullo stesso
-# principio del workflow che gia' chiama resolve_bets_web.php: GitHub
-# Actions come "cron esterno gratuito", non un server sempre acceso.
-#
-# NON include run_model_e_ciclo.py (Model E / AutoML): quello resta
-# SOLO manuale (workflow_dispatch), mai schedulato - vedi commento in
-# main/run_model_e_ciclo.py e nel README del progetto Shadow Lab sul
-# perche' (un ciclo genetico puo' durare minuti, non e' adatto a un
-# cron ricorrente ogni pochi minuti).
-#
-# PERCHE' UN WORKFLOW SEPARATO invece di infilarlo nello stesso job
-# che chiama resolve_bets_web.php: sono due runtime diversi (PHP via
-# HTTP vs Python via CLI) con dipendenze diverse (nessuna vs
-# pip install). Tenerli separati significa che un fallimento nell'uno
-# non blocca l'altro, e i log restano puliti/leggibili per singolo
-# sistema invece di mischiati - stesso principio di isolamento gia'
-# seguito nello schema DB dello Shadow Lab (shadow_bets separata da
-# scommesse).
-# ------------------------------------------------------------
-
-"on":
+on:
   schedule:
-    # Ogni 15 minuti. Stesso ordine di grandezza del cron PHP esistente
-    # (*/20, vedi README step 1) - se preferisci allinearli esattamente
-    # allo stesso intervallo, cambia questo cron e quello PHP insieme.
-    # Sintassi crontab: minuto ora giorno mese giorno-settimana, sempre UTC.
-    - cron: '*/15 * * * *'
-  # Permette anche di lanciarlo a mano dalla tab "Actions" di GitHub,
-  # utile per un primo test senza aspettare il prossimo slot schedulato.
+    - cron: '*/20 * * * *'    # Trigger worker ogni 20 min
+    - cron: '*/15 * * * *'    # Shadow Engine ogni 15 min
   workflow_dispatch: {}
 
-# Evita che due esecuzioni si sovrappongano se una gira piu' a lungo
-# del previsto (es. tanti eventi da valutare) - la successiva aspetta
-# che quella in corso finisca, invece di partire in parallelo e
-# rischiare scritture concorrenti sullo stesso shadow_bets.
+# Evita esecuzioni parallele dello stesso job
 concurrency:
-  group: shadow-engine
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  run-shadow-engine:
+  # ------------------------------------------------------------
+  # JOB 1: Trigger Worker PHP (Playwright) - ogni 20 min
+  # ------------------------------------------------------------
+  trigger-worker:
+    if: github.event.schedule == '*/20 * * * *' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    # Timeout esplicito: se qualcosa si blocca (es. connessione DB che
-    # non risponde), il job viene ucciso invece di consumare minuti
-    # GitHub Actions all'infinito. Il budget interno dello script
-    # (BUDGET_TOTALE_SECONDI = 100, vedi main_shadow_engine.py) e'
-    # comunque molto piu' basso di questo, quindi in condizioni normali
-    # non si arriva mai a questo limite.
     timeout-minutes: 5
-
     steps:
-      - name: Checkout del repository
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Installa dipendenze
+        run: npm ci
+
+      - name: Installa Chromium per Playwright
+        run: npx playwright install --with-deps chromium
+
+      - name: Esegui trigger worker
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          SCAN_URL: ${{ secrets.SCAN_URL }}
+        run: node trigger.js
+
+  # ------------------------------------------------------------
+  # JOB 2: Shadow Engine Python - ogni 15 min
+  # ------------------------------------------------------------
+  shadow-engine:
+    if: github.event.schedule == '*/15 * * * *' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Evita sovrapposizioni: se un run è in corso, il successivo aspetta
+    concurrency:
+      group: shadow-engine
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          # Cache delle dipendenze pip tra esecuzioni successive: la
-          # prima run installa pymysql/python-dotenv da zero, quelle
-          # dopo riusano la cache - risparmia qualche secondo ad ogni
-          # esecuzione, che su un workflow che gira ogni 15 minuti si
-          # somma nel tempo (minuti Actions gratuiti sono limitati sui
-          # repo privati).
           cache: 'pip'
-          cache-dependency-path: ev_scanner_shadow_lab/main/requirements.txt
+          cache-dependency-path: Ev-scanner-cronjob-main/ev_scanner_shadow_lab/main/requirements.txt
 
-      - name: Installa dipendenze
-        working-directory: ev_scanner_shadow_lab/main
+      - name: Installa dipendenze Python
+        working-directory: Ev-scanner-cronjob-main/ev_scanner_shadow_lab/main
         run: pip install -r requirements.txt
 
       - name: Esegui ciclo Shadow Engine
-        working-directory: ev_scanner_shadow_lab/main
+        working-directory: Ev-scanner-cronjob-main/ev_scanner_shadow_lab/main
         env:
-          # Credenziali MAI hardcoded nel workflow: lette dai GitHub
-          # Secrets del repository (Settings -> Secrets and variables ->
-          # Actions -> New repository secret). Stessi valori che oggi
-          # sono, purtroppo, in chiaro in config/config.php - vedi nota
-          # separata sul perche' vale la pena sistemare anche quello.
-          DB_HOST: ${{ secrets.SHADOW_DB_HOST }}
-          DB_PORT: ${{ secrets.SHADOW_DB_PORT }}
-          DB_NAME: ${{ secrets.SHADOW_DB_NAME }}
-          DB_USER: ${{ secrets.SHADOW_DB_USER }}
-          DB_PASSWORD: ${{ secrets.SHADOW_DB_PASSWORD }}
+          # URL completo dell'endpoint resolve_bets_web.php su InfinityFree
+          # Esempio: https://tuodominio.infinityfreeapp.com/worker/resolve_bets_web.php
+          SHADOW_API_URL: ${{ secrets.SHADOW_API_URL }}
+
+          # Bearer Token per autenticazione (deve coincidere con WORKER_SECRET_TOKEN in config/config.php)
+          SHADOW_API_TOKEN: ${{ secrets.SHADOW_API_TOKEN }}
+
+          # Opzionali (default: timeout 30s, max 3 retry)
+          # SHADOW_TIMEOUT_SECONDS: 30
+          # SHADOW_MAX_RETRIES: 3
         run: python3 main_shadow_engine.py
 
       - name: Riassunto esecuzione
