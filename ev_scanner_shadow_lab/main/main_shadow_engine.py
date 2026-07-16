@@ -36,11 +36,30 @@ cosi' opera sugli eventi appena inseriti/aggiornati in `eventi`.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 import traceback
 from dataclasses import dataclass
 from typing import Dict, List, Optional
+
+# Questo script viene lanciato con cwd = ev_scanner_shadow_lab/main (sia
+# dal workflow GitHub Actions "Shadow Engine", working-directory:
+# ev_scanner_shadow_lab/main, sia da CLI seguendo il README: `cd
+# ev_scanner_shadow_lab/main && python3 main_shadow_engine.py`). In
+# quello scenario Python mette in sys.path SOLO la cartella dello
+# script (main/), non la cartella padre (ev_scanner_shadow_lab/): gli
+# import sotto - "models.*", "utils.*" e soprattutto "main.db_layer"
+# (che tenta di importare se stesso come pacchetto "main" dall'esterno,
+# impossibile visto da dentro main/ stesso) falliscono sempre con
+# ModuleNotFoundError, PRIMA ancora di arrivare a leggere una singola
+# riga da eventi. Aggiungendo esplicitamente la cartella padre a
+# sys.path (idempotente: non duplica se gia' presente), tutti e tre i
+# pacchetti diventano risolvibili indipendentemente da dove/come viene
+# invocato lo script.
+_PARENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PARENT_DIR not in sys.path:
+    sys.path.insert(0, _PARENT_DIR)
 
 from config import DEFAULT_CONFIG
 from main.db_layer import (
