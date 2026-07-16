@@ -59,16 +59,27 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          # Cache delle dipendenze pip tra esecuzioni successive: la
+          # prima run installa pymysql/python-dotenv da zero, quelle
+          # dopo riusano la cache - risparmia qualche secondo ad ogni
+          # esecuzione, che su un workflow che gira ogni 15 minuti si
+          # somma nel tempo (minuti Actions gratuiti sono limitati sui
+          # repo privati).
           cache: 'pip'
-          cache-dependency-path: requirements.txt
+          cache-dependency-path: ev_scanner_shadow_lab/main/requirements.txt
 
       - name: Installa dipendenze
-        # RIMOSSO working-directory da qui
+        working-directory: ev_scanner_shadow_lab/main
         run: pip install -r requirements.txt
 
       - name: Esegui ciclo Shadow Engine
-        # RIMOSSO working-directory da qui
+        working-directory: ev_scanner_shadow_lab/main
         env:
+          # Credenziali MAI hardcoded nel workflow: lette dai GitHub
+          # Secrets del repository (Settings -> Secrets and variables ->
+          # Actions -> New repository secret). Stessi valori che oggi
+          # sono, purtroppo, in chiaro in config/config.php - vedi nota
+          # separata sul perche' vale la pena sistemare anche quello.
           DB_HOST: ${{ secrets.SHADOW_DB_HOST }}
           DB_PORT: ${{ secrets.SHADOW_DB_PORT }}
           DB_NAME: ${{ secrets.SHADOW_DB_NAME }}
