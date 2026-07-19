@@ -1,5 +1,5 @@
 name: Shadow Engine (EV Scanner AI Research Lab)
-on:  
+#on:  
   schedule:
     # Ogni 15 minuti - Shadow Engine Python
     - cron: '*/15 * * * *'  
