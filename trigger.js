@@ -5,6 +5,12 @@
 
 const { chromium } = require('playwright');
 
+// Timeout massimo per endpoint. DEVE restare > WORKER_MAX_SECONDS del worker
+// PHP (100s, vedi worker/resolve_bets_web.php): quel worker e' sincrono e
+// risponde solo a ciclo finito, quindi un timeout inferiore fa fallire il
+// trigger anche quando il lavoro lato server e' andato a buon fine.
+const NAV_TIMEOUT_MS = Number(process.env.NAV_TIMEOUT_MS || 180000);
+
 const URLS = [
     { name: 'scan (Sbancobet + quote)', url: process.env.SCAN_URL },
     { name: 'resolve esiti + CLV', url: process.env.WORKER_URL },
@@ -92,9 +98,22 @@ async function triggerUrl(browser, name, url) {
     let success = false;
 
     try {
-        console.log(`[${name}] [${ts()}] Navigazione in corso (timeout 60s, attesa networkidle)...`);
-        // Navigazione: 'networkidle' attende che la sfida JS abbia finito i redirect e la rete sia ferma
-        const response = await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 });
+        console.log(`[${name}] [${ts()}] Navigazione in corso (timeout ${NAV_TIMEOUT_MS / 1000}s)...`);
+        // PERCHE' NON PIU' 'networkidle' CON 60s (fix 31/07/2026):
+        // il worker PHP e' SINCRONO e ha un budget interno di 100s
+        // (WORKER_MAX_SECONDS), quindi la risposta HTTP puo' arrivare anche
+        // dopo 90-100s. Con timeout 60000 la goto scadeva a meta' lavoro:
+        // il PHP continuava e finiva il ciclo, ma qui risultava "FALLITO"
+        // con "page.goto: Timeout 60000ms exceeded" — da cui i fallimenti
+        // intermittenti (andava bene solo quando il ciclo chiudeva <60s).
+        //
+        // In piu' 'networkidle' e' il criterio sbagliato per questo
+        // endpoint: attende 500ms di silenzio di rete DOPO il caricamento,
+        // sommando latenza inutile su una risposta che e' solo JSON.
+        // Ora: 'domcontentloaded' (ritorna appena il documento c'e') e poi
+        // un'attesa esplicita del JSON del worker, che copre anche il
+        // redirect della JS-challenge anti-bot.
+        const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
         const navMs = Date.now() - startedAt;
         const status = response ? response.status() : 'Sconosciuto';
         console.log(`[${name}] [${ts()}] Navigazione completata in ${navMs}ms, HTTP ${status}, URL finale: ${page.url()}`);
@@ -103,6 +122,19 @@ async function triggerUrl(browser, name, url) {
         await page.mouse.move(200, 200);
         console.log(`[${name}] [${ts()}] Attesa stabilizzazione anti-bot (4s)...`);
         await page.waitForTimeout(4000);
+
+        // Attesa esplicita del JSON del worker: sostituisce 'networkidle'.
+        // Copre sia il redirect della JS-challenge sia il fatto che il PHP
+        // possa metterci fino a ~100s a rispondere. Il budget residuo e'
+        // calcolato sul tempo gia' consumato, cosi' il tetto complessivo
+        // per endpoint resta NAV_TIMEOUT_MS.
+        const budgetResiduo = Math.max(15000, NAV_TIMEOUT_MS - (Date.now() - startedAt));
+        console.log(`[${name}] [${ts()}] Attesa risposta JSON del worker (max ${Math.round(budgetResiduo / 1000)}s)...`);
+        await page.waitForFunction(
+            () => !!document.body && document.body.innerText.includes('success'),
+            null,
+            { timeout: budgetResiduo, polling: 1000 }
+        );
 
         // Estrae il testo contenuto nella pagina (il JSON finale generato dal PHP)
         const content = await page.textContent('body');
@@ -122,12 +154,29 @@ async function triggerUrl(browser, name, url) {
         const totalMs = Date.now() - startedAt;
         console.error(`[${name}] [${ts()}] Errore durante la navigazione/sblocco dopo ${totalMs}ms:`, e.message);
         console.error(`[${name}] Stack:`, e.stack);
-        // Scatta uno screenshot di errore se si pianta, utile per fare debug su GitHub
+
+        // Contenuto della pagina al momento dell'errore: spesso e' gia' il
+        // JSON del worker (o la pagina della challenge), e dice molto piu'
+        // di uno screenshot su cosa sia andato storto.
+        const parziale = await page.textContent('body').catch(() => null);
+        if (parziale) {
+            console.error(`[${name}] Contenuto parziale della pagina (${parziale.length} byte):\n`, parziale.trim().slice(0, 2000));
+        }
+
+        // Screenshot di errore, utile per fare debug su GitHub.
+        // Il timeout va alzato rispetto ai 30s di default: se la pagina e'
+        // ancora bloccata sulla richiesta, anche lo screenshot scade e nei
+        // log finiva il messaggio contraddittorio "Impossibile salvare lo
+        // screenshot" seguito subito da "Screenshot salvato in: ...".
         const shotPath = `error-${name.replace(/\s+/g, '_')}.png`;
-        await page.screenshot({ path: shotPath }).catch((shotErr) => {
+        let shotOk = true;
+        await page.screenshot({ path: shotPath, timeout: 60000 }).catch((shotErr) => {
+            shotOk = false;
             console.error(`[${name}] Impossibile salvare lo screenshot di debug (${shotPath}):`, shotErr.message);
         });
-        console.error(`[${name}] Screenshot di debug salvato in: ${shotPath} (visibile tra gli artifact/log della run GitHub Actions, se configurato).`);
+        if (shotOk) {
+            console.error(`[${name}] Screenshot di debug salvato in: ${shotPath} (visibile tra gli artifact/log della run GitHub Actions, se configurato).`);
+        }
     }
 
     await context.close(); // Chiude il contesto della pagina corrente liberando memoria
