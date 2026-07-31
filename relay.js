@@ -17,9 +17,9 @@
 //                         riferisce l'esito
 //
 // FLUSSO (3 passi):
-//   1. Legge la coda da worker/relay_queue_web.php  (navigazione stealth)
+//   1. Legge la coda (?action=relay_queue)          (navigazione stealth)
 //   2. Chiama Telegram / Sofascore direttamente da qui
-//   3. Conferma gli esiti a worker/relay_ack_web.php (navigazione stealth)
+//   3. Conferma gli esiti (?action=relay_ack)        (navigazione stealth)
 //
 // PERCHE' "NAVIGAZIONE STEALTH" E NON UNA NORMALE fetch()
 // InfinityFree ha anche un "Browser Security System" che blocca le richieste in
@@ -35,8 +35,13 @@
 
 const { chromium } = require('playwright');
 
-const QUEUE_URL = process.env.RELAY_QUEUE_URL;   // .../worker/relay_queue_web.php?token=XXX
-const ACK_URL = process.env.RELAY_ACK_URL;       // .../worker/relay_ack_web.php?token=XXX
+// Entrambe puntano allo STESSO file (worker/resolve_bets_web.php), che su questo
+// hosting e' l'unico endpoint del worker raggiungibile dall'esterno in modo
+// affidabile: cambia solo il parametro action.
+//   QUEUE: .../worker/resolve_bets_web.php?token=XXX&action=relay_queue
+//   ACK:   .../worker/resolve_bets_web.php?token=XXX&action=relay_ack
+const QUEUE_URL = process.env.RELAY_QUEUE_URL;
+const ACK_URL = process.env.RELAY_ACK_URL;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 const SOFASCORE_TOKEN = process.env.SOFASCORE_TOKEN || '';
