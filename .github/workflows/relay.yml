@@ -1,0 +1,51 @@
+name: Relay Telegram + Sofascore
+
+# PERCHE' ESISTE QUESTO WORKFLOW
+# InfinityFree blocca a livello DNS le connessioni in uscita verso
+# api.telegram.org (e a quanto pare Sofascore). Non e' un limite generico
+# dell'hosting — odds-api.io, api-sports.io e Betfair funzionano dallo stesso
+# account — ma un blocco mirato che lo staff ha dichiarato impossibile da
+# derogare sui piani gratuiti. Questo runner ha invece internet libero, quindi
+# fa le chiamate uscenti al posto del server. Vedi relay.js per il flusso
+# completo e worker/relay_queue_web.php lato PHP.
+
+on:
+  schedule:
+    # Ogni 15 minuti. NOTE SUL CRON DI GITHUB:
+    #  - il minimo accettato e' 5 minuti ('*/1' viene ignorato in silenzio);
+    #  - le run schedulate possono partire in ritardo (anche 5-30 min) quando
+    #    l'infrastruttura e' carica, soprattutto allo scoccare dell'ora: e'
+    #    normale, non un errore di configurazione;
+    #  - GitHub DISABILITA in automatico i workflow schedulati dopo 60 giorni
+    #    senza commit sul branch di default (arriva una mail di avviso).
+    - cron: '*/15 * * * *'
+  workflow_dispatch: {}
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Installa dipendenze
+        run: npm install
+
+      - name: Installa Chromium per Playwright
+        # Serve per raggiungere il nostro PHP: InfinityFree blocca le richieste
+        # in ingresso non provenienti da un browser reale, quindi una semplice
+        # fetch() verrebbe respinta dalla JS-challenge anti-bot.
+        run: npx playwright install --with-deps chromium
+
+      - name: Esegui il relay
+        env:
+          RELAY_QUEUE_URL: ${{ secrets.RELAY_QUEUE_URL }}
+          RELAY_ACK_URL: ${{ secrets.RELAY_ACK_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SOFASCORE_TOKEN: ${{ secrets.SOFASCORE_TOKEN }}
+        run: node relay.js
