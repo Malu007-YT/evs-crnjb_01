@@ -231,33 +231,77 @@ async function sendTelegram(text) {
 // =============================================================================
 const sofascoreCache = new Map();
 
-async function sofascoreEventsForDate(date) {
+// -----------------------------------------------------------------------------
+// PERCHE' SOFASCORE PASSA DAL BROWSER E NON DA fetch()
+// Il primo tentativo usava una normale fetch() dal runner: Sofascore rispondeva
+// HTTP 403 su OGNI richiesta (0 candidati esaminati su tutte le 24 bet). Non e'
+// un problema di configurazione ne' di token: e' l'anti-bot di Sofascore che
+// rifiuta gli IP dei runner GitHub (datacenter Azure) e le richieste prive di
+// un fingerprint TLS/browser credibile.
+//
+// Qui si riusa il Chromium headless che gia' serve per parlare col nostro PHP:
+// si apre una vera pagina sofascore.com e le chiamate all'API partono da DENTRO
+// quella pagina (page.evaluate). Cosi' la richiesta ha fingerprint TLS reale,
+// cookie di sessione autentici e Origin same-origin — indistinguibile da quella
+// che farebbe il sito stesso mentre lo usi.
+// -----------------------------------------------------------------------------
+let sofascorePage = null;
+// Diventa true se l'API risponde con un errore di accesso (403/429): in quel
+// caso NON abbiamo davvero cercato le partite, quindi sarebbe sbagliato
+// marcarle come "nessun match trovato" — meglio interrompere e ritentare al
+// ciclo successivo, lasciandole in coda intatte.
+let sofascoreBloccato = false;
+
+async function getSofascorePage(browser) {
+    if (sofascorePage) return sofascorePage;
+
+    const context = await browser.newContext({
+        userAgent: UA,
+        viewport: { width: 1920, height: 1080 },
+        locale: 'it-IT',
+        timezoneId: 'Europe/Rome',
+    });
+    const page = await context.newPage();
+    await page.addInitScript(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+    });
+
+    log('Sofascore: apro una sessione browser reale su sofascore.com...');
+    await page.goto('https://www.sofascore.com/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    // Lascia che partano gli script del sito e si depositino i cookie: e'
+    // proprio quello che rende la sessione credibile per l'anti-bot.
+    await page.waitForTimeout(4000);
+
+    sofascorePage = page;
+    return page;
+}
+
+/** GET dell'API Sofascore eseguita da dentro la pagina (same-origin). */
+async function sofascoreApiGet(browser, path) {
+    const page = await getSofascorePage(browser);
+    return await page.evaluate(async (p) => {
+        try {
+            const r = await fetch(p, { headers: { 'Accept': '*/*' } });
+            if (!r.ok) return { ok: false, status: r.status };
+            return { ok: true, status: r.status, data: await r.json() };
+        } catch (e) {
+            return { ok: false, status: 0, error: String(e && e.message) };
+        }
+    }, path);
+}
+
+async function sofascoreEventsForDate(browser, date) {
     if (sofascoreCache.has(date)) return sofascoreCache.get(date);
 
-    const url = `https://api.sofascore.com/api/v1/sport/football/scheduled-events/${date}`;
     let events = [];
-    try {
-        const res = await fetch(url, {
-            headers: {
-                'Accept': '*/*',
-                'User-Agent': UA,
-                'Referer': 'https://www.sofascore.com/',
-                'Origin': 'https://www.sofascore.com',
-            },
-        });
-        if (!res.ok) {
-            // 403 tipicamente = anti-bot di Sofascore sugli IP datacenter
-            // (i runner GitHub stanno su Azure). Diverso da un blocco DNS
-            // di InfinityFree: qui la connessione arriva, e' Sofascore a
-            // rifiutarla. Va segnalato chiaramente per non confonderlo con
-            // "partita non trovata".
-            warn(`Sofascore scheduled-events(${date}): HTTP ${res.status}. Se e' 403, e' Sofascore che blocca gli IP dei runner GitHub, non un problema di configurazione.`);
-        } else {
-            const data = await res.json();
-            events = Array.isArray(data.events) ? data.events : [];
-        }
-    } catch (e) {
-        warn(`Sofascore scheduled-events(${date}): errore di rete — ${e.message}`);
+    const res = await sofascoreApiGet(browser, `/api/v1/sport/football/scheduled-events/${date}`);
+    if (res.ok && res.data && Array.isArray(res.data.events)) {
+        events = res.data.events;
+        log(`Sofascore: ${events.length} partite in palinsesto per ${date}.`);
+    } else {
+        if (res.status === 403 || res.status === 429) sofascoreBloccato = true;
+        warn(`Sofascore scheduled-events(${date}): HTTP ${res.status}${res.error ? ' — ' + res.error : ''}. Se resta 403 anche da dentro il browser, Sofascore sta bloccando l'intero range di IP dei runner GitHub e il voto automatico non e' praticabile da qui.`);
     }
 
     sofascoreCache.set(date, events);
@@ -273,7 +317,7 @@ function ymd(d) {
  * prima e dopo: Sofascore ragiona in UTC mentre le nostre date sono
  * Europe/Rome, quindi una partita in tarda serata puo' "scivolare" di giorno.
  */
-async function findSofascoreEventId(home, away, dateStr) {
+async function findSofascoreEventId(browser, home, away, dateStr) {
     const dt = new Date(dateStr.replace(' ', 'T'));
     if (isNaN(dt.getTime())) return { id: null, candidates: 0, best: 0 };
 
@@ -285,7 +329,7 @@ async function findSofascoreEventId(home, away, dateStr) {
 
     for (const offset of [0, -1, 1]) {
         const d = new Date(dt.getTime() + offset * 86400000);
-        const events = await sofascoreEventsForDate(ymd(d));
+        const events = await sofascoreEventsForDate(browser, ymd(d));
         for (const ev of events) {
             const evHome = ev?.homeTeam?.name || '';
             const evAway = ev?.awayTeam?.name || '';
@@ -300,23 +344,27 @@ async function findSofascoreEventId(home, away, dateStr) {
     return { id: (bestId && best >= MIN_MATCH_SCORE) ? bestId : null, candidates, best: Math.round(best) };
 }
 
-async function sofascoreVote(eventId, vote) {
-    const res = await fetch(`https://www.sofascore.com/api/v1/event/${eventId}/vote`, {
-        method: 'POST',
-        headers: {
-            'Accept': '*/*',
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${SOFASCORE_TOKEN}`,
-            'User-Agent': UA,
-            'Origin': 'https://www.sofascore.com',
-            'Referer': 'https://www.sofascore.com/',
-        },
-        body: JSON.stringify({ vote: String(vote).toUpperCase(), type: 1 }),
-    });
-    if (res.status < 200 || res.status >= 300) {
-        const body = await res.text().catch(() => '');
-        throw new Error(`HTTP ${res.status} ${body.slice(0, 150)}`);
-    }
+/** POST del voto, anch'esso da dentro la pagina sofascore.com (vedi sopra). */
+async function sofascoreVote(browser, eventId, vote) {
+    const page = await getSofascorePage(browser);
+    const res = await page.evaluate(async ({ id, v, token }) => {
+        try {
+            const r = await fetch(`/api/v1/event/${id}/vote`, {
+                method: 'POST',
+                headers: {
+                    'Accept': '*/*',
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${token}`,
+                },
+                body: JSON.stringify({ vote: String(v).toUpperCase(), type: 1 }),
+            });
+            return { ok: r.status >= 200 && r.status < 300, status: r.status, body: (await r.text()).slice(0, 150) };
+        } catch (e) {
+            return { ok: false, status: 0, body: String(e && e.message) };
+        }
+    }, { id: eventId, v: vote, token: SOFASCORE_TOKEN });
+
+    if (!res.ok) throw new Error(`HTTP ${res.status} ${res.body}`);
     return true;
 }
 
@@ -384,14 +432,18 @@ async function sofascoreVote(eventId, vote) {
         } else {
             log(`Sofascore: elaboro ${sfBets.length} bet...`);
             for (const b of sfBets) {
+                if (sofascoreBloccato) {
+                    warn('Sofascore: accesso bloccato (403/429), interrompo. Le bet restanti restano in coda intatte e verranno ritentate al prossimo ciclo — non le marco come "nessun match" perche\' non sono mai state davvero cercate.');
+                    break;
+                }
                 try {
-                    const { id, candidates, best } = await findSofascoreEventId(b.home, b.away, b.date);
+                    const { id, candidates, best } = await findSofascoreEventId(browser, b.home, b.away, b.date);
                     if (!id) {
                         log(`Sofascore: nessun match per "${b.home} - ${b.away}" (${candidates} candidati esaminati, miglior punteggio ${best}/100, soglia ${MIN_MATCH_SCORE}).`);
                         sfNo.push(b.id);
                         continue;
                     }
-                    await sofascoreVote(id, b.selection);
+                    await sofascoreVote(browser, id, b.selection);
                     log(`Sofascore: votato "${b.selection}" su ${b.home} - ${b.away} (evento ${id}, match ${best}/100).`);
                     sfOk.push(b.id);
                 } catch (e) {
