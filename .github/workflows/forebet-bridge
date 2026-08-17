@@ -1,0 +1,51 @@
+name: Ponte Forebet
+
+# PERCHE' ESISTE QUESTO WORKFLOW
+# Forebet risponde HTTP 403 a qualunque richiesta partita da InfinityFree:
+# l'IP condiviso di byetcluster e' filtrato dal loro WAF. Nei log del server si
+# vede il fallimento istantaneo su entrambe le URL. Questo runner ha internet
+# libero, quindi scarica lui le pagine e le spedisce al PHP, che le interpreta
+# e le salva. Vedi forebet.js per il flusso e l'action forebet_ingest lato PHP.
+
+on:
+  schedule:
+    # UNA VOLTA AL GIORNO, alle 06:10 UTC (08:10 in Italia).
+    #
+    # Non di piu', per due motivi. Primo: Forebet ricalcola i suoi pronostici
+    # poche volte al giorno, quindi scaricare piu' spesso restituirebbe gli
+    # stessi identici numeri. Secondo, e piu' importante: serve la probabilita'
+    # PRE-partita, e la mattina presto quasi tutte le partite del giorno devono
+    # ancora iniziare. Piu' tardi si scarica, piu' righe vengono correttamente
+    # rifiutate dalla guardia anti-leakage.
+    #
+    # NOTE SUL CRON DI GITHUB: le run schedulate possono partire in ritardo
+    # (anche 5-30 minuti) quando l'infrastruttura e' carica; GitHub disabilita
+    # in automatico i workflow schedulati dopo 60 giorni senza commit sul
+    # branch di default.
+    - cron: '10 6 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  forebet:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Installa dipendenze
+        run: npm install
+
+      - name: Installa Chromium per Playwright
+        # Serve due volte: per superare il WAF di Forebet, e per superare la
+        # JS-challenge di InfinityFree quando si rispedisce l'HTML al nostro PHP.
+        run: npx playwright install --with-deps chromium
+
+      - name: Esegui il ponte
+        env:
+          FOREBET_INGEST_URL: ${{ secrets.FOREBET_INGEST_URL }}
+          FOREBET_GIORNI: '2'
+        run: node forebet.js
