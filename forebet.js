@@ -456,4 +456,60 @@ async function spedisci(context, etichetta, html) {
                 + `pagamento o lo userscript dal tuo browser.`);
         } else {
             log(`Diagnosi: la maggioranza dei proxy era morta o irraggiungibile. E' qualita' `
-                + `della lista, non un 
+                + `della lista, non un blocco: conviene rilanciare la run o alzare `
+                + `FOREBET_MAX_PROXY.`);
+        }
+        salvaMemoria(mem);
+        process.exit(1);
+    }
+
+    // Lo stesso proxy serve TUTTE le pagine: e' passato una volta, non c'e'
+    // nessun motivo di rimettersi a cercarne un altro per la pagina seguente.
+    const pagine = [];
+    for (let g = 0; g < GIORNI; g++) {
+        const { etichetta, url } = urlForebet(g);
+        const r = await scaricaPagina(proxy, url);
+
+        if (r.html) {
+            log(`[${etichetta}] scaricata: ${r.html.length} byte`);
+            pagine.push({ etichetta, html: alleggerisci(r.html) });
+        } else {
+            log(`[${etichetta}] fallita (${r.errore}). Le altre pagine proseguono.`);
+        }
+    }
+
+    if (pagine.length > 0) registraBuono(mem, proxy);
+    salvaMemoria(mem);
+
+    if (pagine.length === 0) {
+        log('Nessuna pagina scaricata: niente da spedire.');
+        process.exit(1);
+    }
+
+    // Chromium si apre solo ora, e solo perche' c'e' davvero qualcosa da
+    // spedire: avviarlo prima per poi scoprire che non era passato nessun
+    // proxy sarebbe stato tempo e memoria buttati.
+    const browser = await chromium.launch({
+        args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'],
+    });
+    const context = await browser.newContext({
+        userAgent: UA, locale: 'it-IT', timezoneId: 'Europe/Rome',
+        viewport: { width: 1920, height: 1080 },
+    });
+    await context.addInitScript(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    });
+
+    let ok = 0;
+    try {
+        for (const p of pagine) {
+            if (await spedisci(context, p.etichetta, p.html)) ok++;
+        }
+    } finally {
+        await context.close().catch(() => {});
+        await browser.close().catch(() => {});
+    }
+
+    log(`Completato. Pagine consegnate: ${ok}/${pagine.length}. Proxy usato: ${proxy}`);
+    process.exit(ok > 0 ? 0 : 1);
+})();
