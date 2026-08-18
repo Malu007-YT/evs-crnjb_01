@@ -4,6 +4,7 @@
   "private": true,
   "description": "Trigger periodico (via GitHub Actions + browser headless) di worker/resolve_bets_web.php su hosting protetto da JS-challenge anti-bot.",
   "dependencies": {
-    "playwright": "^1.46.0"
+    "playwright": "^1.46.0",
+    "undici": "^6.19.8"
   }
 }
