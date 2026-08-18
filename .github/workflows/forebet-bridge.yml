@@ -22,19 +22,37 @@ on:
     # (anche 5-30 minuti) quando l'infrastruttura e' carica; GitHub disabilita
     # in automatico i workflow schedulati dopo 60 giorni senza commit sul
     # branch di default.
-    - cron: '10 6 * * *'
+    # Due volte al giorno: con i proxy pubblici il successo e' probabilistico,
+    # quindi un secondo tentativo raddoppia le probabilita' senza costare nulla.
+    # Restano entrambi in mattinata/primo pomeriggio perche' serve la
+    # probabilita' PRE-partita: piu' tardi si scarica, piu' righe vengono
+    # correttamente rifiutate dalla guardia anti-leakage.
+    - cron: '10 6,11 * * *'
   workflow_dispatch: {}
 
 jobs:
   forebet:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+
+      # MEMORIA DEI PROXY fra una run e l'altra. E' l'ottimizzazione che conta
+      # di piu': un IP che ieri ha superato il WAF di Forebet quasi sempre lo
+      # supera anche oggi, e senza cache quell'informazione andrebbe persa a
+      # ogni run, ricominciando la ricerca da zero ogni mattina.
+      # La key cambia a ogni run (cosi' la cache viene RISCRITTA, non solo
+      # letta); restore-keys ripesca la piu' recente disponibile.
+      - name: Ripristina memoria proxy
+        uses: actions/cache@v4
+        with:
+          path: .proxy-cache
+          key: forebet-proxy-${{ github.run_id }}
+          restore-keys: forebet-proxy-
 
       - name: Installa dipendenze
         run: npm install
@@ -48,4 +66,14 @@ jobs:
         env:
           FOREBET_INGEST_URL: ${{ secrets.FOREBET_INGEST_URL }}
           FOREBET_GIORNI: '2'
+          # Quanti proxy provare per pagina prima di arrendersi. Alzalo se nei
+          # log vedi soprattutto proxy morti; NON serve alzarlo se vedi
+          # soprattutto 403 (in quel caso il problema e' un altro, vedi la
+          # diagnosi che lo script stampa da solo).
+          FOREBET_MAX_PROXY: '300'
+          # Scadenza INTERNA della ricerca proxy. Deve restare comodamente
+          # sotto timeout-minutes: se e' GitHub a tagliare il job, il processo
+          # muore senza salvare la memoria dei proxy e la run successiva
+          # riparte da zero — che e' esattamente quello che era successo.
+          FOREBET_SCADENZA_MIN: '6'
         run: node forebet.js
