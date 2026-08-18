@@ -88,8 +88,16 @@ const LISTA_PROXY = 'https://api.proxyscrape.com/v4/free-proxy-list/get'
 // bloccato — un test che dice sempre di si' non e' un test.
 const URL_SONDA = 'https://www.forebet.com/it/cosa-e-il-forebet';
 
-const CONCORRENZA = 25;
-const TIMEOUT_SONDA_MS = 9000;
+// SCADENZA GLOBALE della ricerca. Esiste perche' nella run del 18 agosto il
+// job e' stato tagliato da GitHub a 10 minuti mentre lo script era ancora nel
+// mezzo: il processo e' morto senza arrivare a salvaMemoria(), e i 7 proxy
+// bloccati che aveva gia' identificato sono andati persi. Un lavoro che viene
+// ucciso senza salvare quello che ha imparato e' un lavoro da rifare da capo.
+// Questo tetto deve restare COMODAMENTE sotto timeout-minutes del workflow.
+const SCADENZA_RICERCA_MS = parseInt(process.env.FOREBET_SCADENZA_MIN || '6', 10) * 60000;
+
+const CONCORRENZA = 40;
+const TIMEOUT_SONDA_MS = 8000;
 const TIMEOUT_DOWNLOAD_MS = 25000;
 const MIN_BYTE_HTML = 20000;
 
@@ -109,12 +117,38 @@ const INTESTAZIONI = {
 function agentePer(proxyUrl) {
     return new ProxyAgent({
         uri: proxyUrl,
+        // TIMEOUT DI CONNESSIONE ESPLICITO — senza questo la v3 impiegava 3
+        // MINUTI per un'ondata da 25 invece dei 9 secondi previsti.
+        // headersTimeout e bodyTimeout di undici cominciano a contare DOPO che
+        // la connessione TCP e' stabilita: un proxy morto che scarta i
+        // pacchetti in silenzio non risponde mai al SYN, e il timeout che
+        // scatta e' quello del kernel (oltre due minuti). Meta' della lista
+        // pubblica e' fatta di proxy cosi'.
+        connect: { timeout: 4000 },
+        // proxyTls governa la connessione VERSO IL PROXY, connect quella verso
+        // Forebet dentro il tunnel. Servono entrambe: misurato su un indirizzo
+        // che scarta i pacchetti in silenzio, con il solo connect si usciva in
+        // 10,5s, con proxyTls in 3,5s. Su 300 tentativi la differenza e' fra
+        // una run che sta nei tempi e una che GitHub taglia a meta'.
+        proxyTls: { timeout: 4000 },
         requestTls: {
             // NON si tocca: vedi regola 2 in testa al file.
             rejectUnauthorized: true,
             servername: 'www.forebet.com',
         },
     });
+}
+
+/**
+ * Tetto DURO sulla durata di un tentativo, indipendente da quale strato si
+ * blocchi (DNS, TCP, TLS, HTTP). I timeout di undici coprono solo alcune di
+ * queste fasi; questo li copre tutte. Cintura e bretelle, di proposito: e'
+ * gia' successo che un tentativo restasse appeso e trascinasse con se' l'intera
+ * ondata, perche' Promise.all aspetta anche chi non tornera' mai.
+ */
+function conScadenza(segnaleOndata, ms) {
+    const scadenza = AbortSignal.timeout(ms);
+    return segnaleOndata ? AbortSignal.any([segnaleOndata, scadenza]) : scadenza;
 }
 
 // ============================================================================
@@ -194,7 +228,7 @@ async function sonda(proxyUrl, esiti, segnale) {
             headersTimeout: TIMEOUT_SONDA_MS,
             bodyTimeout: TIMEOUT_SONDA_MS,
             maxRedirections: 3,
-            signal: segnale,
+            signal: conScadenza(segnale, TIMEOUT_SONDA_MS),
         });
         await r.body.dump();
 
@@ -207,7 +241,13 @@ async function sonda(proxyUrl, esiti, segnale) {
         // AbortError = un altro proxy della stessa ondata ha gia' vinto: non e'
         // un fallimento e non va contato come tale, altrimenti la diagnosi
         // finale conterebbe come "morti" decine di proxy mai realmente provati.
-        if (e.name !== 'AbortError') esiti.morti++;
+        // TimeoutError = scaduto il nostro tetto: e' un proxy morto a tutti
+        // gli effetti e va contato. AbortError = un altro proxy della stessa
+        // ondata ha gia' vinto, quindi non e' un fallimento: contarlo
+        // gonfierebbe i "morti" con decine di tentativi mai davvero conclusi,
+        // e falserebbe la diagnosi finale.
+        if (e.name === 'TimeoutError') esiti.morti++;
+        else if (e.name !== 'AbortError') esiti.morti++;
         return null;
     } finally {
         if (agent) await agent.close().catch(() => {});
@@ -225,6 +265,7 @@ async function scaricaPagina(proxyUrl, url) {
             headersTimeout: TIMEOUT_DOWNLOAD_MS,
             bodyTimeout: TIMEOUT_DOWNLOAD_MS,
             maxRedirections: 3,
+            signal: conScadenza(null, TIMEOUT_DOWNLOAD_MS + 5000),
         });
 
         if (r.statusCode !== 200) { await r.body.dump(); return { errore: `HTTP ${r.statusCode}` }; }
@@ -246,9 +287,10 @@ async function scaricaPagina(proxyUrl, url) {
  * sprecherebbe i piu' promettenti), poi la lista fresca a ondate parallele con
  * interruzione al primo successo.
  */
-async function trovaProxyBuono(mem, esiti) {
+async function trovaProxyBuono(mem, esiti, scadenza) {
     // --- 1. i ricordati ---
     for (const b of mem.buoni.sort((x, y) => (y.successi - x.successi) || (y.visto - x.visto))) {
+        if (Date.now() > scadenza) { log('Scadenza raggiunta durante i proxy in memoria.'); return null; }
         const esito = await sonda(b.proxy, esiti, undefined);
         if (esito === 'ok') {
             log(`Proxy dalla memoria: ${b.proxy} (gia' riuscito ${b.successi} volte). `
@@ -287,8 +329,14 @@ async function trovaProxyBuono(mem, esiti) {
     log(`Lista: ${lista.length} proxy nuovi da provare (esclusi ${noti.size} gia' noti).`);
 
     for (let i = 0; i < lista.length; i += CONCORRENZA) {
+        if (Date.now() > scadenza) {
+            log(`Scadenza di ricerca raggiunta dopo ${i} tentativi: mi fermo qui e SALVO quello `
+                + `che ho imparato, invece di farmi tagliare a meta' da GitHub.`);
+            return null;
+        }
         const ondata = lista.slice(i, i + CONCORRENZA);
         const ac = new AbortController();
+        const t0 = Date.now();
 
         const vincente = await new Promise((risolvi) => {
             let rimasti = ondata.length;
@@ -306,7 +354,8 @@ async function trovaProxyBuono(mem, esiti) {
                 + `Ondata interrotta, gli altri tentativi annullati.`);
             return vincente;
         }
-        log(`${i + ondata.length}/${lista.length} tentati — ${JSON.stringify(esiti)}`);
+        log(`${i + ondata.length}/${lista.length} tentati in ${((Date.now() - t0) / 1000).toFixed(1)}s `
+            + `— ${JSON.stringify(esiti)}`);
     }
 
     return null;
@@ -390,7 +439,7 @@ async function spedisci(context, etichetta, html) {
 
     let proxy;
     try {
-        proxy = await trovaProxyBuono(mem, esiti);
+        proxy = await trovaProxyBuono(mem, esiti, Date.now() + SCADENZA_RICERCA_MS);
     } catch (e) {
         console.error(`Ricerca proxy fallita: ${e.message}`);
         salvaMemoria(mem);
@@ -407,60 +456,4 @@ async function spedisci(context, etichetta, html) {
                 + `pagamento o lo userscript dal tuo browser.`);
         } else {
             log(`Diagnosi: la maggioranza dei proxy era morta o irraggiungibile. E' qualita' `
-                + `della lista, non un blocco: conviene rilanciare la run o alzare `
-                + `FOREBET_MAX_PROXY.`);
-        }
-        salvaMemoria(mem);
-        process.exit(1);
-    }
-
-    // Lo stesso proxy serve TUTTE le pagine: e' passato una volta, non c'e'
-    // nessun motivo di rimettersi a cercarne un altro per la pagina seguente.
-    const pagine = [];
-    for (let g = 0; g < GIORNI; g++) {
-        const { etichetta, url } = urlForebet(g);
-        const r = await scaricaPagina(proxy, url);
-
-        if (r.html) {
-            log(`[${etichetta}] scaricata: ${r.html.length} byte`);
-            pagine.push({ etichetta, html: alleggerisci(r.html) });
-        } else {
-            log(`[${etichetta}] fallita (${r.errore}). Le altre pagine proseguono.`);
-        }
-    }
-
-    if (pagine.length > 0) registraBuono(mem, proxy);
-    salvaMemoria(mem);
-
-    if (pagine.length === 0) {
-        log('Nessuna pagina scaricata: niente da spedire.');
-        process.exit(1);
-    }
-
-    // Chromium si apre solo ora, e solo perche' c'e' davvero qualcosa da
-    // spedire: avviarlo prima per poi scoprire che non era passato nessun
-    // proxy sarebbe stato tempo e memoria buttati.
-    const browser = await chromium.launch({
-        args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'],
-    });
-    const context = await browser.newContext({
-        userAgent: UA, locale: 'it-IT', timezoneId: 'Europe/Rome',
-        viewport: { width: 1920, height: 1080 },
-    });
-    await context.addInitScript(() => {
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    });
-
-    let ok = 0;
-    try {
-        for (const p of pagine) {
-            if (await spedisci(context, p.etichetta, p.html)) ok++;
-        }
-    } finally {
-        await context.close().catch(() => {});
-        await browser.close().catch(() => {});
-    }
-
-    log(`Completato. Pagine consegnate: ${ok}/${pagine.length}. Proxy usato: ${proxy}`);
-    process.exit(ok > 0 ? 0 : 1);
-})();
+                + `della lista, non un 
