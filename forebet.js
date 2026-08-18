@@ -65,7 +65,10 @@ const { request, ProxyAgent } = require('undici');
 
 const INGEST_URL = process.env.FOREBET_INGEST_URL;
 const GIORNI = parseInt(process.env.FOREBET_GIORNI || '2', 10);
-const MAX_PROXY = parseInt(process.env.FOREBET_MAX_PROXY || '300', 10);
+// La lista pubblica ne contiene circa ventimila: provarne 300 era un campione
+// minuscolo. Con le ondate ora bloccate a 20s, mille tentativi costano poco
+// piu' di due minuti, e piu' tentativi valgono piu' della pazienza sul singolo.
+const MAX_PROXY = parseInt(process.env.FOREBET_MAX_PROXY || '1000', 10);
 
 // Cartella messa in cache da GitHub Actions fra una run e l'altra.
 const CARTELLA_MEMORIA = process.env.FOREBET_CACHE_DIR || '.proxy-cache';
@@ -96,11 +99,11 @@ const URL_SONDA = 'https://www.forebet.com/it/cosa-e-il-forebet';
 // Questo tetto deve restare COMODAMENTE sotto timeout-minutes del workflow.
 const SCADENZA_RICERCA_MS = parseInt(process.env.FOREBET_SCADENZA_MIN || '6', 10) * 60000;
 
-const CONCORRENZA = 40;
-const TIMEOUT_SONDA_MS = 8000;
+const CONCORRENZA = 60;
+const TIMEOUT_SONDA_MS = 12000;
 // Durata massima di un'ondata, comunque vada. Piu' larga del timeout della
 // singola sonda per lasciare spazio a chi ha risposto tardi ma legittimamente.
-const TETTO_ONDATA_MS = 15000;
+const TETTO_ONDATA_MS = 20000;
 const TIMEOUT_DOWNLOAD_MS = 25000;
 const MIN_BYTE_HTML = 20000;
 
@@ -253,12 +256,34 @@ async function sonda(proxyUrl, esiti, segnale) {
             maxRedirections: 3,
             signal: conScadenza(segnale, TIMEOUT_SONDA_MS),
         });
-        await r.body.dump();
 
-        if (r.statusCode === 403) { esiti.bloccati++; return 'bloccato'; }
-        if (r.statusCode !== 200)  { esiti.altri++;    return null; }
+        if (r.statusCode === 403) {
+            esiti.bloccati++;
+            // CHI dice no? Il 403 puo' venire da Forebet (IP in lista nera)
+            // oppure dal proxy stesso, che molti server aperti restituiscono
+            // quando rifiutano di inoltrare verso host non in whitelist. Sono
+            // due diagnosi opposte: nel primo caso i proxy pubblici non
+            // serviranno mai, nel secondo il problema e' la qualita' della
+            // lista e insistere ha senso. Si ispezionano i primi campioni:
+            // l'intestazione 'server' e i marcatori di CDN lo dicono subito.
+            if (esiti.campioni403.length < 3) {
+                const h = r.headers || {};
+                esiti.campioni403.push({
+                    server: h.server || '(assente)',
+                    cf: h['cf-ray'] ? 'si' : 'no',
+                    via: h.via || '(assente)',
+                    tipo: h['content-type'] || '(assente)',
+                });
+            }
+            await r.body.dump();
+            return 'bloccato';
+        }
+        if (r.statusCode !== 200) { esiti.altri++; await r.body.dump(); return null; }
 
         esiti.ok++;
+        // Il corpo va scartato anche qui: la sonda vuole solo lo stato, e un
+        // corpo non letto lascia il socket occupato.
+        await r.body.dump();
         return 'ok';
     } catch (e) {
         // Il conteggio distingue due cose diverse, e la distinzione conta:
@@ -483,7 +508,7 @@ async function spedisci(context, etichetta, html) {
     log(`Avvio ponte Forebet — ${GIORNI} giorno/i`);
 
     const mem = caricaMemoria();
-    const esiti = { ok: 0, bloccati: 0, morti: 0, altri: 0 };
+    const esiti = { ok: 0, bloccati: 0, morti: 0, altri: 0, campioni403: [] };
 
     let proxy;
     try {
@@ -498,14 +523,32 @@ async function spedisci(context, etichetta, html) {
         log(`NESSUN proxy e passato. Esiti: ${JSON.stringify(esiti)}`);
         // I contatori sono separati proprio per distinguere due fallimenti che
         // richiedono risposte opposte.
-        if (esiti.bloccati > esiti.morti) {
-            log(`Diagnosi: la maggioranza dei proxy VIVI ha ricevuto 403. Forebet blocca anche `
-                + `questi IP: i proxy pubblici non bastano, servirebbe un pool residenziale a `
-                + `pagamento o lo userscript dal tuo browser.`);
+        // La statistica che conta non e' quanti proxy hanno fallito, ma quanti
+        // di quelli VIVI sono stati respinti: i morti dicono solo che la lista
+        // e' scadente, e non hanno mai raggiunto Forebet.
+        const vivi = esiti.bloccati + esiti.ok + esiti.altri;
+        const pctBloccati = vivi > 0 ? Math.round(100 * esiti.bloccati / vivi) : 0;
+        log(`Proxy che hanno risposto: ${vivi}. Di questi, ${esiti.bloccati} respinti con 403 `
+            + `(${pctBloccati}%).`);
+
+        if (esiti.campioni403.length) {
+            log(`Chi emette il 403 (primi campioni): ${JSON.stringify(esiti.campioni403)}`);
+            log(`Come leggerlo: se "server" e' Cloudflare/nginx o cf e' "si", il rifiuto arriva `
+                + `da Forebet e l'IP e' in lista nera. Se compare "via" o un server tipo Squid, `
+                + `a rifiutare e' il PROXY, che non vuole inoltrare — e in quel caso il problema `
+                + `e' la lista, non Forebet, e insistere ha senso.`);
+        }
+
+        if (vivi >= 20 && pctBloccati >= 90) {
+            log(`Diagnosi: praticamente TUTTI i proxy vivi vengono respinti. Se i campioni qui `
+                + `sopra indicano Forebet, i proxy pubblici non basteranno mai: servirebbe un `
+                + `pool residenziale a pagamento o lo userscript dal tuo browser.`);
+        } else if (vivi < 20) {
+            log(`Diagnosi: solo ${vivi} proxy hanno risposto, troppo pochi per concludere `
+                + `qualcosa. E' qualita' della lista: alza FOREBET_MAX_PROXY o rilancia.`);
         } else {
-            log(`Diagnosi: la maggioranza dei proxy era morta o irraggiungibile. E' qualita' `
-                + `della lista, non un blocco: conviene rilanciare la run o alzare `
-                + `FOREBET_MAX_PROXY.`);
+            log(`Diagnosi: una parte dei proxy vivi NON viene respinta. Vale la pena insistere: `
+                + `alza FOREBET_MAX_PROXY e rilancia.`);
         }
         salvaMemoria(mem);
         process.exit(1);
