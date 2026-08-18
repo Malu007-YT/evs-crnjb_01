@@ -98,6 +98,9 @@ const SCADENZA_RICERCA_MS = parseInt(process.env.FOREBET_SCADENZA_MIN || '6', 10
 
 const CONCORRENZA = 40;
 const TIMEOUT_SONDA_MS = 8000;
+// Durata massima di un'ondata, comunque vada. Piu' larga del timeout della
+// singola sonda per lasciare spazio a chi ha risposto tardi ma legittimamente.
+const TETTO_ONDATA_MS = 15000;
 const TIMEOUT_DOWNLOAD_MS = 25000;
 const MIN_BYTE_HTML = 20000;
 
@@ -219,9 +222,29 @@ function registraBloccato(mem, proxy) {
  * stato, il corpo viene scartato senza leggerlo.
  */
 async function sonda(proxyUrl, esiti, segnale) {
-    let agent;
+    const agent = agentePer(proxyUrl);
+
+    // TIMER ESTERNO CHE ABBATTE L'AGENT.
+    //
+    // Non e' ridondanza rispetto ai timeout di undici: e' l'unica cosa che
+    // funziona davvero. Con un proxy che ACCETTA la connessione TCP e poi tace
+    // (caso comunissimo nelle liste pubbliche: la porta e' aperta ma dietro non
+    // c'e' piu' niente) il tunnel CONNECT non si completa mai, e allora:
+    //   - connect.timeout non scatta, perche' il TCP e' connesso;
+    //   - headersTimeout non scatta, perche' non ha ancora iniziato a contare;
+    //   - perfino AbortSignal viene ignorato in quella fase.
+    // Riprodotto con un finto proxy che accetta e tace: la promessa restava
+    // appesa oltre 30 secondi e trascinava con se' l'intera ondata — e' la
+    // ragione per cui la run delle 07:50 e' rimasta ferma fino al taglio dei
+    // dieci minuti. Distruggere l'agent dall'esterno fa fallire la richiesta e
+    // la promessa si risolve puntuale (misurato: 8,0s esatti).
+    let scaduto = false;
+    const timer = setTimeout(() => {
+        scaduto = true;
+        agent.destroy().catch(() => {});
+    }, TIMEOUT_SONDA_MS);
+
     try {
-        agent = agentePer(proxyUrl);
         const r = await request(URL_SONDA, {
             dispatcher: agent,
             headers: INTESTAZIONI,
@@ -238,27 +261,38 @@ async function sonda(proxyUrl, esiti, segnale) {
         esiti.ok++;
         return 'ok';
     } catch (e) {
-        // AbortError = un altro proxy della stessa ondata ha gia' vinto: non e'
-        // un fallimento e non va contato come tale, altrimenti la diagnosi
-        // finale conterebbe come "morti" decine di proxy mai realmente provati.
-        // TimeoutError = scaduto il nostro tetto: e' un proxy morto a tutti
-        // gli effetti e va contato. AbortError = un altro proxy della stessa
-        // ondata ha gia' vinto, quindi non e' un fallimento: contarlo
-        // gonfierebbe i "morti" con decine di tentativi mai davvero conclusi,
-        // e falserebbe la diagnosi finale.
-        if (e.name === 'TimeoutError') esiti.morti++;
+        // Il conteggio distingue due cose diverse, e la distinzione conta:
+        // e' la diagnosi finale a dire se convenga insistere con i proxy
+        // pubblici o cambiare strada. Scaduto o errore di rete = proxy morto.
+        // AbortError = un altro proxy della stessa ondata ha gia' vinto, quindi
+        // non e' un fallimento: contarlo gonfierebbe i "morti" con decine di
+        // tentativi mai davvero conclusi.
+        if (scaduto) esiti.morti++;
         else if (e.name !== 'AbortError') esiti.morti++;
         return null;
     } finally {
-        if (agent) await agent.close().catch(() => {});
+        clearTimeout(timer);
+        // destroy() e NON close(): close() aspetta gentilmente che le richieste
+        // in corso finiscano, e se una e' appesa non ritorna MAI. Stando in un
+        // finally, teneva bloccata la promessa della sonda e con lei l'intera
+        // ondata. destroy() taglia corto, che e' esattamente quello che serve
+        // con un proxy che non risponde. Niente await: la chiusura non deve
+        // poter rallentare la ricerca.
+        agent.destroy().catch(() => {});
     }
 }
 
 /** Scarica una pagina intera attraverso un proxy gia' promosso dalla sonda. */
 async function scaricaPagina(proxyUrl, url) {
-    let agent;
+    const agent = agentePer(proxyUrl);
+    // Stesso timer esterno della sonda, stessa ragione (vedi il commento li').
+    let scaduto = false;
+    const timer = setTimeout(() => {
+        scaduto = true;
+        agent.destroy().catch(() => {});
+    }, TIMEOUT_DOWNLOAD_MS + 5000);
+
     try {
-        agent = agentePer(proxyUrl);
         const r = await request(url, {
             dispatcher: agent,
             headers: INTESTAZIONI,
@@ -275,9 +309,10 @@ async function scaricaPagina(proxyUrl, url) {
 
         return { html };
     } catch (e) {
-        return { errore: e.message };
+        return { errore: scaduto ? 'tempo scaduto' : e.message };
     } finally {
-        if (agent) await agent.close().catch(() => {});
+        clearTimeout(timer);
+        agent.destroy().catch(() => {});
     }
 }
 
@@ -338,16 +373,29 @@ async function trovaProxyBuono(mem, esiti, scadenza) {
         const ac = new AbortController();
         const t0 = Date.now();
 
-        const vincente = await new Promise((risolvi) => {
-            let rimasti = ondata.length;
-            for (const p of ondata) {
-                sonda(p, esiti, ac.signal).then(esito => {
-                    if (esito === 'ok') { ac.abort(); risolvi(p); return; }
-                    if (esito === 'bloccato') registraBloccato(mem, p);
-                    if (--rimasti === 0) risolvi(null);
-                });
-            }
-        });
+        // TETTO DURO SULL'ONDATA. I timeout sulle singole richieste non
+        // bastano: due volte ormai un dettaglio interno (prima il connect al
+        // proxy, poi la chiusura dell'agent) e' rimasto fuori da ogni limite e
+        // ha tenuto appesa tutta la ricerca. Qui l'ondata ha una durata massima
+        // garantita QUALUNQUE cosa succeda dentro, cosi' il ciclo puo' sempre
+        // proseguire e arrivare al controllo di scadenza.
+        const vincente = await Promise.race([
+            new Promise((risolvi) => {
+                let rimasti = ondata.length;
+                for (const p of ondata) {
+                    sonda(p, esiti, ac.signal).then(esito => {
+                        if (esito === 'ok') { ac.abort(); risolvi(p); return; }
+                        if (esito === 'bloccato') registraBloccato(mem, p);
+                        if (--rimasti === 0) risolvi(null);
+                    }).catch(() => { if (--rimasti === 0) risolvi(null); });
+                }
+            }),
+            new Promise((risolvi) => setTimeout(() => risolvi(null), TETTO_ONDATA_MS).unref()),
+        ]);
+        // In ogni caso si annulla il resto: se ha vinto il tetto, i tentativi
+        // ancora in volo vanno fermati prima di passare all'ondata seguente,
+        // altrimenti si accumulano.
+        ac.abort();
 
         if (vincente) {
             log(`Proxy trovato: ${vincente} dopo ${i + ondata.length} tentativi. `
